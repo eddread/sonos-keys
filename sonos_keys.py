@@ -35,6 +35,7 @@ from Quartz import (
     kCGSessionEventTap,
     kCGHeadInsertEventTap,
     kCGEventTapOptionDefault,
+    kCGEventTapOptionListenOnly,
     CGEventMaskBit,
     kCGEventKeyDown,
     kCGEventKeyUp,
@@ -335,7 +336,7 @@ class SonosKeysApp(rumps.App):
         self.tap = CGEventTapCreate(
             kCGSessionEventTap,
             kCGHeadInsertEventTap,
-            kCGEventTapOptionDefault,
+            kCGEventTapOptionListenOnly,
             mask,
             self._tap_callback,
             None,
