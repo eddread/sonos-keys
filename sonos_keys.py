@@ -330,8 +330,7 @@ class SonosKeysApp(rumps.App):
             log("Inactive - volume keys pass through normally")
 
     def _create_event_tap(self):
-        mask = (CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp)
-                | CGEventMaskBit(NSSystemDefined))
+        mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp)
 
         self.tap = CGEventTapCreate(
             kCGSessionEventTap,
@@ -351,9 +350,6 @@ class SonosKeysApp(rumps.App):
         CGEventTapEnable(self.tap, False)
 
     def _tap_callback(self, proxy, event_type, event, refcon):
-        if event_type == NSSystemDefined:
-            return self._handle_media_key(event)
-
         if event_type not in (kCGEventKeyDown, kCGEventKeyUp):
             return event
 
