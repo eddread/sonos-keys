@@ -1,0 +1,4 @@
+soco>=0.30
+rumps>=0.4.0
+pyobjc-framework-Quartz>=9.0
+pyobjc-framework-Cocoa>=9.0
