@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Sonos Keys - Control your Sonos Amp volume with Ctrl+volume keys.
-Activates automatically when a target external display is connected.
+Sonos Keys - Control your Sonos volume with the keyboard volume keys.
+Activates automatically when the default sound output is the target device.
 """
 
+import ctypes
+import ctypes.util
 import json
 import os
+import struct
 import sys
 import threading
-import time
 
 import rumps
 import soco
@@ -19,29 +21,18 @@ from AppKit import (
 )
 from Foundation import NSTimer
 from Quartz import (
-    CGDisplayRegisterReconfigurationCallback,
-    CGDisplayVendorNumber,
-    CGDisplayModelNumber,
-    CGDisplaySerialNumber,
-    CGGetActiveDisplayList,
     CGEventTapCreate,
     CGEventTapEnable,
-    CGEventGetIntegerValueField,
-    CGEventGetFlags,
     CFMachPortCreateRunLoopSource,
     CFRunLoopAddSource,
     CFRunLoopGetMain,
-    kCGDisplayBeginConfigurationFlag,
     kCGSessionEventTap,
     kCGHeadInsertEventTap,
     kCGEventTapOptionDefault,
-    kCGEventTapOptionListenOnly,
+    kCGEventTapDisabledByTimeout,
+    kCGEventTapDisabledByUserInput,
     CGEventMaskBit,
-    kCGEventKeyDown,
-    kCGEventKeyUp,
-    kCGKeyboardEventKeycode,
     kCFRunLoopCommonModes,
-    kCGEventFlagMaskControl,
     NSSystemDefined,
 )
 from HIServices import AXIsProcessTrusted
@@ -49,9 +40,13 @@ from HIServices import AXIsProcessTrusted
 CONFIG_PATH = os.path.expanduser("~/.config/sonos-keys/config.json")
 VOLUME_STEP = 2
 
-KEYCODE_F10 = 109
-KEYCODE_F11 = 103
-KEYCODE_F12 = 111
+NX_SUBTYPE_AUX_CONTROL_BUTTONS = 8
+NX_KEYDOWN = 0x0A
+MEDIA_KEY_ACTIONS = {
+    0: "_volume_up",
+    1: "_volume_down",
+    7: "_mute_toggle",
+}
 
 
 def log(msg):
@@ -62,7 +57,7 @@ def load_config():
     defaults = {
         "sonos_ip": None,
         "sonos_name": None,
-        "target_display": None,
+        "target_output": "Scarlett 2i2",
         "volume_step": VOLUME_STEP,
     }
     if os.path.exists(CONFIG_PATH):
@@ -108,29 +103,45 @@ def discover_sonos_amp(config):
     return None
 
 
-def get_connected_displays():
-    err, display_ids, count = CGGetActiveDisplayList(10, None, None)
-    displays = []
-    if err == 0 and display_ids:
-        for did in display_ids:
-            vendor = CGDisplayVendorNumber(did)
-            model = CGDisplayModelNumber(did)
-            serial = CGDisplaySerialNumber(did)
-            displays.append({"vendor": vendor, "model": model, "serial": serial, "id": did})
-    return displays
+_coreaudio = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
+_cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+_cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+_cf.CFRelease.argtypes = [ctypes.c_void_p]
 
 
-def has_target_display(config):
-    target = config.get("target_display")
-    displays = get_connected_displays()
+class _PropertyAddress(ctypes.Structure):
+    _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("element", ctypes.c_uint32)]
 
-    if target is None:
-        return len(displays) > 0
 
-    for d in displays:
-        if d["vendor"] == target["vendor"] and d["model"] == target["model"]:
-            return True
-    return False
+def _fourcc(code):
+    return struct.unpack(">I", code.encode())[0]
+
+
+_coreaudio.AudioObjectGetPropertyData.argtypes = [
+    ctypes.c_uint32, ctypes.POINTER(_PropertyAddress), ctypes.c_uint32,
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p,
+]
+
+def get_default_output_name():
+    addr = _PropertyAddress(_fourcc("dOut"), _fourcc("glob"), 0)
+    device = ctypes.c_uint32()
+    size = ctypes.c_uint32(ctypes.sizeof(device))
+    if _coreaudio.AudioObjectGetPropertyData(1, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(device)):
+        return None
+    addr = _PropertyAddress(_fourcc("lnam"), _fourcc("glob"), 0)
+    name_ref = ctypes.c_void_p()
+    size = ctypes.c_uint32(ctypes.sizeof(name_ref))
+    if _coreaudio.AudioObjectGetPropertyData(device.value, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(name_ref)):
+        return None
+    buf = ctypes.create_string_buffer(256)
+    ok = _cf.CFStringGetCString(name_ref, buf, len(buf), 0x08000100)
+    _cf.CFRelease(name_ref)
+    return buf.value.decode() if ok else None
+
+
+def has_target_output(config):
+    name = get_default_output_name()
+    return bool(name) and config["target_output"].lower() in name.lower()
 
 
 class VolumeHUD:
@@ -245,10 +256,9 @@ class SonosKeysApp(rumps.App):
         step = self.config.get("volume_step", VOLUME_STEP)
         self.status_item = rumps.MenuItem("Status: starting...")
         self.device_item = rumps.MenuItem("Device: searching...")
-        self.keys_item = rumps.MenuItem("Keys: Ctrl+Vol Down/Up/Mute")
+        self.keys_item = rumps.MenuItem("Keys: Volume Down/Up/Mute")
         self.toggle_item = rumps.MenuItem("Override: Auto", callback=self.toggle_override)
-        self.displays_item = rumps.MenuItem("Show displays...", callback=self.show_displays)
-        self.set_display_item = rumps.MenuItem("Set target display...", callback=self.set_target_display)
+        self.set_output_item = rumps.MenuItem("Set target output...", callback=self.set_target_output)
         self.set_device_item = rumps.MenuItem("Set Sonos device...", callback=self.set_sonos_device)
         self.step_up_item = rumps.MenuItem(
             "Volume step: {} (click to change)".format(step), callback=self.change_step
@@ -262,14 +272,12 @@ class SonosKeysApp(rumps.App):
             self.toggle_item,
             self.step_up_item,
             None,
-            self.displays_item,
-            self.set_display_item,
+            self.set_output_item,
             self.set_device_item,
         ]
 
         self._override = None
 
-        CGDisplayRegisterReconfigurationCallback(self._display_changed, None)
         self._create_event_tap()
         threading.Thread(target=self._setup, daemon=True).start()
 
@@ -291,20 +299,11 @@ class SonosKeysApp(rumps.App):
             self.device_item.title = "Device: not found"
             self.sonos = None
 
-    def _display_changed(self, display_id, flags, userinfo):
-        if flags & kCGDisplayBeginConfigurationFlag:
-            return
-        threading.Thread(target=self._delayed_evaluate, daemon=True).start()
-
-    def _delayed_evaluate(self):
-        time.sleep(1)
-        self._evaluate_state()
-
     def _evaluate_state(self):
         if self._override is not None:
             should_activate = self._override
         else:
-            should_activate = has_target_display(self.config) and self.sonos is not None
+            should_activate = has_target_output(self.config) and self.sonos is not None
 
         if should_activate and not self.active:
             self._activate()
@@ -320,23 +319,25 @@ class SonosKeysApp(rumps.App):
             self.active = True
             if self.tap:
                 CGEventTapEnable(self.tap, True)
-            log("Active - Ctrl+volume keys controlling Sonos")
+            log("Active - volume keys controlling Sonos")
 
     def _deactivate(self):
         with self.lock:
             if not self.active:
                 return
             self.active = False
+            if self.tap:
+                CGEventTapEnable(self.tap, False)
             log("Inactive - volume keys pass through normally")
 
     def _create_event_tap(self):
-        mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp)
-
+        # Media keys only: also tapping key down/up puts every keystroke through
+        # this Python callback, which conflicted with Wispr Flow.
         self.tap = CGEventTapCreate(
             kCGSessionEventTap,
             kCGHeadInsertEventTap,
-            kCGEventTapOptionListenOnly,
-            mask,
+            kCGEventTapOptionDefault,
+            CGEventMaskBit(NSSystemDefined),
             self._tap_callback,
             None,
         )
@@ -350,59 +351,29 @@ class SonosKeysApp(rumps.App):
         CGEventTapEnable(self.tap, False)
 
     def _tap_callback(self, proxy, event_type, event, refcon):
-        if event_type not in (kCGEventKeyDown, kCGEventKeyUp):
+        if event_type in (kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput):
+            if self.active:
+                CGEventTapEnable(self.tap, True)
             return event
 
-        keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
-
-        if keycode not in (KEYCODE_F10, KEYCODE_F11, KEYCODE_F12):
+        if event_type != NSSystemDefined or not self.active:
             return event
 
-        flags = CGEventGetFlags(event)
-        if not (flags & kCGEventFlagMaskControl):
-            return event
-
-        if not self.active:
-            return event
-
-        is_down = event_type == kCGEventKeyDown
-        if is_down:
-            if keycode == KEYCODE_F12:
-                threading.Thread(target=self._volume_up, daemon=True).start()
-            elif keycode == KEYCODE_F11:
-                threading.Thread(target=self._volume_down, daemon=True).start()
-            elif keycode == KEYCODE_F10:
-                threading.Thread(target=self._mute_toggle, daemon=True).start()
-
-        return None  # suppress
-
-    def _handle_media_key(self, event):
         try:
             ns_event = NSEvent.eventWithCGEvent_(event)
-            if ns_event is None or ns_event.subtype() != 8:
+            if ns_event is None or ns_event.subtype() != NX_SUBTYPE_AUX_CONTROL_BUTTONS:
                 return event
 
             data1 = ns_event.data1()
             key_code = (data1 & 0xFFFF0000) >> 16
             key_state = (data1 & 0xFF00) >> 8
 
-            if key_code not in (0, 1, 7):
+            action = MEDIA_KEY_ACTIONS.get(key_code)
+            if action is None:
                 return event
 
-            flags = CGEventGetFlags(event)
-            if not (flags & kCGEventFlagMaskControl):
-                return event
-
-            if not self.active:
-                return event
-
-            if key_state == 0x0A:  # key down
-                if key_code == 0:
-                    threading.Thread(target=self._volume_up, daemon=True).start()
-                elif key_code == 1:
-                    threading.Thread(target=self._volume_down, daemon=True).start()
-                elif key_code == 7:
-                    threading.Thread(target=self._mute_toggle, daemon=True).start()
+            if key_state == NX_KEYDOWN:
+                threading.Thread(target=getattr(self, action), daemon=True).start()
 
             return None
 
@@ -451,16 +422,16 @@ class SonosKeysApp(rumps.App):
             threading.Thread(target=self._find_sonos, daemon=True).start()
 
     def _update_status(self):
-        display_connected = has_target_display(self.config)
+        output_matches = has_target_output(self.config)
         if self.active:
             self.title = "\U0001F50A"
-            self.status_item.title = "Status: active - Ctrl+volume keys control Sonos"
+            self.status_item.title = "Status: active - volume keys control Sonos"
         elif not self.sonos:
             self.title = "\U0001F508"
             self.status_item.title = "Status: Sonos not found"
-        elif not display_connected:
+        elif not output_matches:
             self.title = "\U0001F508"
-            self.status_item.title = "Status: display not connected"
+            self.status_item.title = "Status: output is {}".format(get_default_output_name())
         else:
             self.title = "\U0001F508"
             self.status_item.title = "Status: inactive"
@@ -477,38 +448,17 @@ class SonosKeysApp(rumps.App):
             self.toggle_item.title = "Override: Auto"
         self._evaluate_state()
 
-    def show_displays(self, sender):
-        displays = get_connected_displays()
-        if not displays:
-            rumps.alert("No displays detected")
-            return
-        lines = []
-        for d in displays:
-            lines.append(
-                "Vendor: {}  Model: {}  Serial: {}".format(d["vendor"], d["model"], d["serial"])
-            )
-        rumps.alert("Connected Displays", "\n".join(lines))
-
-    def set_target_display(self, sender):
-        displays = get_connected_displays()
-        if not displays:
-            rumps.alert("No displays detected")
-            return
-
-        if len(displays) == 1:
-            target = {"vendor": displays[0]["vendor"], "model": displays[0]["model"]}
-            self.config["target_display"] = target
+    def set_target_output(self, sender):
+        response = rumps.Window(
+            "Activate when the sound output name contains:",
+            "Set Target Output",
+            default_text=self.config["target_output"],
+            dimensions=(200, 24),
+        ).run()
+        if response.clicked and response.text.strip():
+            self.config["target_output"] = response.text.strip()
             save_config(self.config)
-            rumps.alert("Target display set", "Vendor: {}  Model: {}".format(target["vendor"], target["model"]))
             self._evaluate_state()
-        else:
-            lines = []
-            for i, d in enumerate(displays):
-                lines.append("{}. Vendor: {}  Model: {}".format(i + 1, d["vendor"], d["model"]))
-            rumps.alert(
-                "Multiple displays",
-                "Connect only your target display and try again.\n\n" + "\n".join(lines),
-            )
 
     def set_sonos_device(self, sender):
         response = rumps.Window(
@@ -543,6 +493,10 @@ class SonosKeysApp(rumps.App):
                 self.step_up_item.title = "Volume step: {} (click to change)".format(step)
             except ValueError:
                 pass
+
+    @rumps.timer(2)
+    def output_check(self, _):
+        self._evaluate_state()
 
     @rumps.timer(30)
     def periodic_check(self, _):
