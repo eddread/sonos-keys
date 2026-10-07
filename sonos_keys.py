@@ -331,8 +331,8 @@ class SonosKeysApp(rumps.App):
             log("Inactive - volume keys pass through normally")
 
     def _create_event_tap(self):
-        # Media keys only: also tapping key down/up puts every keystroke through
-        # this Python callback, which conflicted with Wispr Flow.
+        # Intercepting NSSystemDefined has disrupted Wispr Flow's fn key hook,
+        # so the tap is only enabled while active.
         self.tap = CGEventTapCreate(
             kCGSessionEventTap,
             kCGHeadInsertEventTap,
